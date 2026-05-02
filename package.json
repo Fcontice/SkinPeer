@@ -1,0 +1,18 @@
+{
+  "name": "skinpeer",
+  "private": true,
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "dev": "concurrently \"pnpm --filter @skinpeer/server dev\" \"pnpm --filter @skinpeer/web dev\"",
+    "build": "pnpm --filter @skinpeer/shared build && pnpm --filter @skinpeer/server build && pnpm --filter @skinpeer/web build",
+    "lint": "pnpm --filter @skinpeer/server lint && pnpm --filter @skinpeer/web lint",
+    "make-admin": "npx tsx scripts/makeAdmin.ts",
+    "test": "pnpm --filter @skinpeer/server test && pnpm --filter @skinpeer/web test",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.45.0",
+    "concurrently": "^8.2.2",
+    "typescript": "^5.4.0"
+  }
+}

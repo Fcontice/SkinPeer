@@ -1,0 +1,6 @@
+process.env.SUPABASE_URL ??= 'http://localhost:54321'
+process.env.SUPABASE_SERVICE_ROLE_KEY ??= 'test-service-role'
+process.env.SUPABASE_ANON_KEY ??= 'test-anon'
+process.env.STEAM_API_KEY ??= 'test-steam-key'
+process.env.OPENAI_API_KEY ??= 'sk-test-stub'
+process.env.NODE_ENV = 'test'

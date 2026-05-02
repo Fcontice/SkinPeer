@@ -1,0 +1,3 @@
+-- Run AFTER applying 001_initial.sql
+-- Seeds a test admin. Replace with real UUID after signing up.
+-- update public.profiles set is_admin = true where id = '<user-uuid>';
