@@ -419,3 +419,51 @@ Format: date/time, prompt, what was built, bugs hit, how they were fixed.
 
 ---
 
+## [2026-05-01] — Profile page redesign + Steam trade URL/token helper modal
+
+**Prompt:** "Refactor the Profile page UI and add a Steam trade URL field with a guided helper modal that gates the Send-on-Steam CTA." Full multi-section spec covering: sectioned profile cards with toggles, collapsed-with-status Steam trade URL section, reusable SteamTradeUrlModal matching a visual reference, encryption at rest for the WebAPI token, schema additions to profiles, gating logic for the proposal-page CTA with auto-retry-on-save and a counterparty reminder action, plus accompanying API + CLAUDE.md updates.
+
+**AI tool used:** Claude Code (Opus 4.7, 1M context)
+
+**Implemented:**
+- New migration `supabase/migrations/008_steam_webapi_token.sql` — pointer column `profiles.steam_webapi_token_secret_id uuid` into `vault.secrets`, plus `SECURITY DEFINER` RPCs `set_steam_webapi_token` / `clear_steam_webapi_token` granted only to `service_role` so plaintext only crosses the wire once on save.
+- `apps/server/src/lib/steamWebApiToken.ts` — token validator pinging `IEconService/GetTradeOffersSummary` with a JWT-shape pre-check before paying for the network round trip.
+- `apps/server/src/schemas/traderNetwork.ts` — `UpdateSteamTradeUrlSchema` now accepts both `steam_trade_url` and `steam_webapi_token` as independently optional with a `.refine` requiring at least one.
+- `apps/server/src/routes/traders.ts` — extended `PATCH /api/traders/me/steam-trade-url` to accept both fields, validate token via Steam ping, return `tokenError` (without persisting bad tokens) while the URL still saves; added `DELETE /api/traders/me/steam-trade-url` clearing both. `GET /me/profile` now returns derived `has_steam_webapi_token`.
+- `apps/server/src/routes/conversations.ts` — new `POST /api/conversations/:id/steam-trade-url-reminder` posting a server-templated `kind: system` message that names both parties.
+- `apps/server/src/routes/proposals.ts` — `GET /api/proposals/:id` now returns `display_names: { creator, recipient }` and `viewer_has_steam_webapi_token`.
+- `apps/web/src/components/SteamTradeUrlModal.tsx` (new) — reusable modal with two stacked input groups, validate-on-save CONFIRM per input, full-width DONE disabled until URL is confirmed, masked-token UX, "How to obtain your token" instructions card.
+- `apps/web/src/pages/EditProfilePage.tsx` — full rewrite. Header with avatar + display name + Steam profile link; four cards (Identity, Trade preferences, Steam connection, Account); inline `ToggleSwitch`; collapsed-with-status Steam trade URL section showing partner-only masked URL on expand; sticky bottom-right unsaved-changes bar; "Saved" toast on success.
+- `apps/web/src/components/SendTradeOnSteamButton.tsx` — full rewrite. Clicker missing → opens `SteamTradeUrlModal` inline; on save the deeplink retries automatically. Counterparty missing → no modal; inline message naming them with a "Send reminder message" button posting the templated system message.
+- `apps/web/src/pages/TradeProposalPage.tsx` + `apps/web/src/types/traderNetwork.ts` + `apps/web/src/context/AuthContext.tsx` — type extensions for the new server fields (`display_names`, `viewer_has_steam_webapi_token`, `has_steam_webapi_token`, `steam_id`, `created_at`).
+- `CLAUDE.md` — migration 008 row in the migrations table, profiles column doc updated, new "Sensitive fields on profiles (encryption pattern)" subsection, Send-on-Steam gating rule under business rules, two new endpoints in the API table.
+
+**Bugs / Errors Encountered:**
+- `Edit` tool failed twice with "File has been modified since read" on `apps/server/src/schemas/traderNetwork.ts` and `apps/web/src/types/traderNetwork.ts`. Fix: re-read each file before retrying the edit; both files had been touched between read and write (likely by an editor/linter watcher).
+- DEV_LOG append via Bash heredoc failed with "unexpected EOF while looking for matching quote" because the entry contained an unescaped apostrophe inside the single-quoted heredoc. Fix: switched to Read + Edit to append the entry — never bash-heredoc content with apostrophes again.
+- (Otherwise clean — type checks, 176 server tests, 21 web tests, and full production build all green on first run after each major file landed.)
+
+**Prompts that worked:**
+- The user's original spec was unusually structured — sectioned with explicit "idle/saved state" rules, exact API contract, reusable-component requirement, and a separate "Out of scope" list. Worked because every behavior had a clear UI consequence; almost zero ambiguity to bounce back on. The "Out of scope" list in particular kept me from spiraling into account-deletion or avatar-upload code.
+- Delegated the initial codebase survey to a single `Explore` subagent with a numbered list of 11 specific lookups (file paths, API routes, schemas, design tokens, modal patterns) and a 600-word cap. Came back with everything needed for the implementation plan in one round-trip — no follow-up greps needed before writing code.
+
+**Prompts that failed:**
+- The spec said `PATCH /api/v1/profile` and `DELETE /api/v1/profile/steam-trade-url`. CLAUDE.md decision D3 explicitly mandates no `/api/v1` prefix, and the existing route already lived at `/api/traders/me/steam-trade-url`. Honoring the spec literally would have created a parallel API surface; honored the codebase convention instead. Lesson: API path naming in a spec is a good intent signal but always cross-check against the existing route table.
+- Spec also said "PATCH /api/v1/profile — extend Zod schema to accept steam_trade_url and steam_webapi_token". Implied the profile-row PATCH (which here is `/api/traders/me/profile`, trader_profiles fields). But putting Steam trade URL there would couple two unrelated concerns. Kept them on the steam-trade-url endpoint — same single endpoint that takes both fields, just under the URL-named path that matches what's being mutated.
+
+**Human overrides:**
+- Encryption strategy: prompt said "pgsodium / Supabase Vault." Chose Vault (`vault.secrets` + `vault.create_secret`) over pgsodium. Reason: pgsodium is on the Supabase deprecation path; Vault is the current recommended pattern and round-trips through cleaner SQL helpers. The pointer-column-only-on-`profiles` shape also makes the encryption-pattern note in CLAUDE.md generalizable to future sensitive fields.
+- Reminder system message: instead of letting the client send `kind: system` through the existing `POST /messages` endpoint (would require loosening server-side `kind: user` hardcoding), added a dedicated `POST /api/conversations/:id/steam-trade-url-reminder` that templates the message body server-side. Reason: keeps the chat record auditable and consistent, prevents arbitrary client-authored system messages.
+- Save bar UX: spec said "sticky bottom-right when changes are unsaved." Implemented as a small floating card (rounded, shadow, fixed bottom-6 right-6) rather than a full sticky bottom bar. Reason: less intrusive on a long single-column form, still always visible. Trivial to switch to full-width sticky if user prefers.
+- Skipped writing tests for the new endpoints. Reason: existing test suite has no coverage for `/api/traders/me/steam-trade-url` to begin with, the prompt did not ask for tests, and the encryption RPCs need a real Supabase instance to exercise meaningfully (not a stub round-trip). Flagged this gap in the final summary so the user can decide.
+- Did NOT run a browser smoke test despite CLAUDE.md's "test the UI in a browser" guidance. Reason: migration 008 has not been applied to a Supabase instance from this machine, and the encryption + Steam ping paths require live env. Stated this explicitly in the final summary rather than claiming end-to-end success.
+
+**Notes:**
+- CLAUDE.md "profiles" row was already documenting `steam_trade_url`. The new `steam_webapi_token_secret_id` line is appended in the same cell so the encryption pattern is visible at the table level. The new "Sensitive fields on profiles (encryption pattern)" subsection generalizes the pattern for any future sensitive field — single source of truth so we do not reinvent the wheel.
+- The `SteamTradeUrlModal` is used from two callsites today (Profile page and proposal page CTA). Its API (`open`, `onClose`, `initialTradeUrl`, `initialHasToken`, `onSaved`) is intentionally minimal — `onSaved` returns the full saved snapshot so callers can update local state without a refetch. If a third caller appears (e.g. an onboarding flow), the modal should still fit without props additions.
+- Send-on-Steam retry logic: when the clicker hits Send without a URL, we set `pendingSendOnSave=true`, open the modal, and on close (whether DONE or X) we re-check parsed URL state and auto-open the deeplink. `window.open` from a non-direct-click handler can be popup-blocked in some browsers; have not verified this in practice. If users report blocked popups, the fix is to defer the `window.open` to an explicit "Try again" button in the modal's done flow. Worth a follow-up agent if it bites.
+- The proposal route now returns three new fields (`display_names`, `viewer_has_steam_webapi_token`) alongside the existing `steam_trade_urls`. Considered consolidating into a single `parties: { creator: { steam_trade_url, display_name }, recipient: { ... } }` object, but that is a breaking change for any other consumer of the route shape. Kept additive.
+- The `ToggleSwitch` is inlined in `EditProfilePage.tsx` because it is the only place using it so far. If a second caller appears, hoist to `apps/web/src/components/`.
+
+---
+

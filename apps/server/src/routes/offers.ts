@@ -1,10 +1,17 @@
 import { Router } from 'express'
+import rateLimit from 'express-rate-limit'
 import { z } from 'zod'
 import { supabase } from '../lib/supabase'
 import { authenticate } from '../middleware/authenticate'
 import { validate } from '../middleware/validate'
 import { CreateOfferSchema, OfferItemSchema } from '../schemas/traderNetwork'
 import { generateProposalVerificationCode } from '../services/proposalCodeService'
+import {
+  runOfferReview,
+  buildOfferReviewInput,
+  AI_SAFETY_REVIEW_MODEL,
+} from '../lib/openai'
+import { getMarketPrice } from '../lib/marketPrice'
 
 const router = Router()
 router.use(authenticate)
@@ -149,6 +156,192 @@ router.get('/by-conversation/:conversation_id', async (req, res, next) => {
       .order('created_at', { ascending: true })
     res.json({ rows: data ?? [] })
   } catch (err) { next(err) }
+})
+
+// Per-user 1/min rate limit on the AI offer-review endpoint, layered on top
+// of the global IP limiter. Cache hits don't go through this — only forced
+// refreshes do.
+const offerReviewRefreshLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 1,
+  keyGenerator: (req) => req.user?.id ?? req.ip ?? 'anonymous',
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Refresh limit: 1 review per minute. Wait a moment and try again.' },
+  // Skip when the cached row is going to be returned — we conditionally
+  // bypass by setting req._cacheHit before reaching the limiter (see route).
+  skip: (req) => Boolean((req as unknown as { _cacheHit?: boolean })._cacheHit),
+})
+
+type StoredOfferReview = {
+  id: string
+  trade_offer_id: string
+  viewer_user_id: string
+  payload: unknown
+  model: string
+  created_at: string
+}
+
+// POST /api/offers/:id/review
+// Returns the cached per-(offer, viewer) review if present and refresh!=true.
+// On miss (or refresh=true), runs the model, upserts, and returns the row.
+// Per-user 1/min limiter applies on cache miss + refresh paths only.
+router.post('/:id/review', async (req, res, next) => {
+  try {
+    const me = req.user!.id
+    const offer = await loadOffer(req.params.id)
+    if (!offer) { res.status(404).json({ error: 'Offer not found' }); return }
+    if (offer.from_user_id !== me && offer.to_user_id !== me) {
+      res.status(403).json({ error: 'Forbidden' }); return
+    }
+
+    const refresh = req.query.refresh === 'true' || req.body?.refresh === true
+
+    if (!refresh) {
+      const { data: cached } = await supabase
+        .from('trade_offer_reviews')
+        .select('*')
+        .eq('trade_offer_id', offer.id)
+        .eq('viewer_user_id', me)
+        .maybeSingle()
+      if (cached) {
+        res.json(cached as StoredOfferReview)
+        return
+      }
+    }
+
+    // From here we will hit the model — apply the refresh limiter inline.
+    await new Promise<void>((resolve, reject) => {
+      offerReviewRefreshLimiter(req, res, (err?: unknown) => {
+        if (err) reject(err)
+        else resolve()
+      })
+    })
+    if (res.headersSent) return
+
+    // Build viewer-perspective payload.
+    const viewerIsSender = offer.from_user_id === me
+    const counterpartyId = viewerIsSender ? offer.to_user_id : offer.from_user_id
+
+    const viewerSendsRaw = (viewerIsSender ? offer.offered_items : offer.requested_items) as OfferItemPayload[]
+    const viewerReceivesRaw = (viewerIsSender ? offer.requested_items : offer.offered_items) as OfferItemPayload[]
+    const viewerSends = viewerSendsRaw.map((i) => ({ name: i.name, wear: i.wear, rarity: i.rarity }))
+    const viewerReceives = viewerReceivesRaw.map((i) => ({ name: i.name, wear: i.wear, rarity: i.rarity }))
+
+    // Steam Market price hints — null when uncached/unavailable. The market
+    // price helper does its own caching so this is cheap on hot paths.
+    const allNames = Array.from(
+      new Set([...viewerSends.map((i) => i.name), ...viewerReceives.map((i) => i.name)]),
+    )
+    const priceEntries = await Promise.all(
+      allNames.map(async (n) => {
+        try {
+          const p = await getMarketPrice(n)
+          return [n, p?.lowest_price ?? p?.median_price ?? null] as const
+        } catch {
+          return [n, null] as const
+        }
+      }),
+    )
+    const prices: Record<string, string | null> = Object.fromEntries(priceEntries)
+
+    const { data: viewerProfile } = await supabase
+      .from('trader_profiles')
+      .select('display_name, total_trades, average_rating')
+      .eq('user_id', me)
+      .maybeSingle()
+    const { data: counterpartyProfile } = await supabase
+      .from('trader_profiles')
+      .select('display_name, total_trades, average_rating')
+      .eq('user_id', counterpartyId)
+      .maybeSingle()
+
+    const { data: viewerAuth } = await supabase
+      .from('profiles')
+      .select('created_at')
+      .eq('id', me)
+      .single()
+    const { data: counterpartyAuth } = await supabase
+      .from('profiles')
+      .select('created_at')
+      .eq('id', counterpartyId)
+      .single()
+
+    const ageDays = (iso?: string | null) =>
+      iso ? Math.floor((Date.now() - new Date(iso).getTime()) / 86400000) : 0
+
+    const { data: messages } = await supabase
+      .from('messages')
+      .select('sender_id, body, created_at')
+      .eq('conversation_id', offer.conversation_id)
+      .order('created_at', { ascending: false })
+      .limit(30)
+
+    const recentMessages = (messages ?? [])
+      .reverse()
+      .map((m) => ({
+        sender: (m.sender_id === me ? 'viewer' : 'counterparty') as 'viewer' | 'counterparty',
+        body: m.body,
+        created_at: m.created_at,
+      }))
+
+    const since90 = new Date(Date.now() - 90 * 86400000).toISOString()
+    const { count: reportedCount } = await supabase
+      .from('reports')
+      .select('id', { count: 'exact', head: true })
+      .eq('subject_user_id', counterpartyId)
+      .gte('created_at', since90)
+
+    const inputBody = buildOfferReviewInput({
+      viewer_role: viewerIsSender ? 'sender' : 'recipient',
+      viewer: {
+        display_name: viewerProfile?.display_name ?? '(no profile)',
+        total_trades: viewerProfile?.total_trades ?? 0,
+        average_rating: viewerProfile?.average_rating ?? null,
+        account_age_days: ageDays(viewerAuth?.created_at),
+      },
+      counterparty: {
+        display_name: counterpartyProfile?.display_name ?? '(no profile)',
+        total_trades: counterpartyProfile?.total_trades ?? 0,
+        average_rating: counterpartyProfile?.average_rating ?? null,
+        account_age_days: ageDays(counterpartyAuth?.created_at),
+      },
+      viewer_sends: viewerSends,
+      viewer_receives: viewerReceives,
+      prices,
+      recent_messages: recentMessages,
+      counterparty_reported_within_90d: (reportedCount ?? 0) > 0,
+    })
+
+    const result = await runOfferReview(inputBody)
+    if (!result) {
+      res.status(502).json({ error: 'AI review unavailable, try again later' })
+      return
+    }
+
+    const { data: stored, error: storeErr } = await supabase
+      .from('trade_offer_reviews')
+      .upsert(
+        {
+          trade_offer_id: offer.id,
+          viewer_user_id: me,
+          payload: result,
+          model: AI_SAFETY_REVIEW_MODEL,
+        },
+        { onConflict: 'trade_offer_id,viewer_user_id' },
+      )
+      .select()
+      .single()
+
+    if (storeErr || !stored) {
+      res.status(500).json({ error: storeErr?.message ?? 'Failed to store review' })
+      return
+    }
+
+    res.status(201).json(stored as StoredOfferReview)
+  } catch (err) {
+    next(err)
+  }
 })
 
 // GET /api/offers/:id — participant only
